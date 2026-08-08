@@ -10,6 +10,7 @@
 This function is closely following the load_xdf reference implementation.
 """
 
+import functools
 import gzip
 import io
 import itertools
@@ -31,15 +32,15 @@ class StreamData:
 
     def __init__(self, xml):
         """Init a new StreamData object from a stream header."""
-        fmts = dict(
-            double64=np.float64,
-            float32=np.float32,
-            string=object,
-            int32=np.int32,
-            int16=np.int16,
-            int8=np.int8,
-            int64=np.int64,
-        )
+        fmts = {
+            "double64": np.float64,
+            "float32": np.float32,
+            "string": object,
+            "int32": np.int32,
+            "int16": np.int16,
+            "int8": np.int8,
+            "int64": np.int64,
+        }
         # number of channels
         self.nchns = int(xml["info"]["channel_count"][0])
         # nominal sampling rate in Hz
@@ -75,6 +76,29 @@ class StreamData:
             self.samplebytes = self.nchns * self.dtype.itemsize
 
 
+def verbose(func):
+    """Apply the ``verbose`` argument of ``func`` to the logger for that call only.
+
+    Without this, passing ``verbose`` leaves the level set on the module logger for
+    the rest of the process, overriding whatever the application configured and
+    breaking the documented meaning of ``verbose=None`` for every later call.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, verbose=None, **kwargs):
+        if verbose is None:
+            return func(*args, verbose=verbose, **kwargs)
+        level = logger.level
+        logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
+        try:
+            return func(*args, verbose=verbose, **kwargs)
+        finally:
+            logger.setLevel(level)
+
+    return wrapper
+
+
+@verbose
 def load_xdf(
     filename,
     select_streams=None,
@@ -121,7 +145,9 @@ def load_xdf(
           - None: load all streams (default).
 
         verbose : Passing True will set logging level to DEBUG, False will set it to
-          WARNING, and None will use root logger level. (default: None)
+          WARNING, and None will use root logger level. The previous level is restored
+          before this function returns, so the setting does not affect later calls or
+          the rest of the application. (default: None)
 
         synchronize_clocks : Whether to enable clock synchronization based on
           ClockOffset chunks. (default: true)
@@ -200,10 +226,7 @@ def load_xdf(
     Examples:
         >>> streams, fileheader = load_xdf('myrecording.xdf')
     """
-    if verbose is not None:
-        logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
-
-    logger.info("Importing XDF file %s..." % filename)
+    logger.info(f"Importing XDF file {filename}...")
 
     # if select_streams is an int or a list of int, load only streams associated with
     # the corresponding stream IDs
@@ -213,11 +236,11 @@ def load_xdf(
         pass
     elif isinstance(select_streams, int):
         select_streams = [select_streams]
-    elif all([isinstance(elem, dict) for elem in select_streams]):
+    elif all(isinstance(elem, dict) for elem in select_streams):
         select_streams = match_streaminfos(resolve_streams(filename), select_streams)
         if not select_streams:  # no streams found
             raise ValueError("No matching streams found.")
-    elif not all([isinstance(elem, int) for elem in select_streams]):
+    elif not all(isinstance(elem, int) for elem in select_streams):
         raise ValueError(
             "Argument 'select_streams' must be an int, a list of ints, or a list of "
             "dicts."
@@ -279,13 +302,16 @@ def load_xdf(
                     continue
                 else:
                     # to be executed if no exception was raised
-                    log_str += ", StreamId={}".format(StreamId)
+                    log_str += f", StreamId={StreamId}"
                     logger.debug(log_str)
 
-            if StreamId is not None and select_streams is not None:
-                if StreamId not in select_streams:
-                    f.read(chunklen - 2 - 4)  # skip remaining chunk contents
-                    continue
+            if (
+                StreamId is not None
+                and select_streams is not None
+                and StreamId not in select_streams
+            ):
+                f.read(chunklen - 2 - 4)  # skip remaining chunk contents
+                continue
 
             # read the chunk's [Content]...
             if tag == 1:
@@ -316,7 +342,7 @@ def load_xdf(
                     # append to the time series...
                     temp[StreamId].time_series.append(values)
                     temp[StreamId].time_stamps.append(stamps)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 (tolerate any corruption in the chunk)
                     # an error occurred (perhaps a chopped-off file): emit a warning and
                     # scan forward to the next recognized chunk
                     logger.error(
@@ -395,7 +421,7 @@ def load_xdf(
             if len(stream.time_stamps) > 0:
                 stream.segments.append((0, len(stream.time_stamps) - 1))  # inclusive
 
-    for k in streams.keys():
+    for k in streams:
         stream = streams[k]
         tmp = temp[k]
         if "stream_id" in stream["info"]:  # this is non-standard
@@ -404,9 +430,8 @@ def load_xdf(
                 "Using the 'stream_id' value {} from the beginning of the StreamHeader "
                 "chunk instead.".format(stream["info"]["stream_id"], k)
             )
-        if synchronize_clocks:
-            if tmp.segments != tmp.clock_segments:
-                logger.warning(f"Stream {k}: Segments and clock-segments differ")
+        if synchronize_clocks and tmp.segments != tmp.clock_segments:
+            logger.warning(f"Stream {k}: Segments and clock-segments differ")
         stream["info"]["stream_id"] = k
         stream["info"]["effective_srate"] = tmp.effective_srate
         stream["info"]["segments"] = tmp.segments
@@ -428,20 +453,20 @@ def open_xdf(file):
 
     if isinstance(file, (io.RawIOBase, io.BufferedIOBase)):
         if isinstance(file, io.TextIOBase):
-            raise ValueError("file has to be opened in binary mode")
+            raise TypeError("file has to be opened in binary mode")
         f = file
     else:
         filename = Path(file)  # ensure convert to pathlib object
         # check absolute path after following symlinks
         if not filename.resolve().exists():
-            raise Exception("file %s does not exist." % filename)
+            raise FileNotFoundError(f"file {filename} does not exist.")
 
         if filename.suffix == ".xdfz" or filename.suffixes == [".xdf", ".gz"]:
-            f = gzip.open(str(filename), "rb")
+            f = gzip.open(str(filename), "rb")  # noqa: SIM115 (returned open for caller)
         else:
-            f = open(str(filename), "rb")
+            f = open(str(filename), "rb")  # noqa: SIM115 (returned open for caller)
     if f.read(4) != b"XDF:":  # magic bytes
-        raise IOError("Invalid XDF file {}".format(file))
+        raise OSError(f"Invalid XDF file {file}")
     return f
 
 
@@ -869,10 +894,8 @@ def _clock_sync(
 
                     if ts_start == ts_stop:
                         logger.warning(
-                            (
-                                f"Stream {stream_id}: "
-                                f"No samples in clock offsets {range_i}, skipping..."
-                            )
+                            f"Stream {stream_id}: "
+                            f"No samples in clock offsets {range_i}, skipping..."
                         )
                     else:
                         stream.clock_segments.append((ts_start, ts_stop - 1))
@@ -1055,7 +1078,7 @@ def match_streaminfos(stream_infos, parameters, *, case_sensitive=True):
     match = False
     for request in parameters:
         for info in stream_infos:
-            for key in request.keys():
+            for key in request:
                 if case_sensitive:
                     match = info[key] == request[key]
                 else:
@@ -1097,10 +1120,8 @@ def parse_xdf(fname):
     chunks : list
         List of all chunks contained in the XDF file.
     """
-    chunks = []
     with open_xdf(fname) as f:
-        for chunk in _read_chunks(f):
-            chunks.append(chunk)
+        chunks = list(_read_chunks(f))
     return chunks
 
 
@@ -1111,19 +1132,19 @@ def parse_chunks(chunks):
         if chunk["tag"] == 2:  # stream header chunk
             # if you edit, check for consistency with parsing in load_xdf
             streams.append(
-                dict(
-                    stream_id=chunk["stream_id"],
-                    name=chunk.get("name"),  # optional
-                    type=chunk.get("type"),  # optional
-                    source_id=chunk.get("source_id"),  # optional
-                    created_at=chunk.get("created_at"),  # optional
-                    uid=chunk.get("uid"),  # optional
-                    session_id=chunk.get("session_id"),  # optional
-                    hostname=chunk.get("hostname"),  # optional
-                    channel_count=int(chunk["channel_count"]),
-                    channel_format=chunk["channel_format"],
-                    nominal_srate=float(chunk["nominal_srate"]),
-                )
+                {
+                    "stream_id": chunk["stream_id"],
+                    "name": chunk.get("name"),  # optional
+                    "type": chunk.get("type"),  # optional
+                    "source_id": chunk.get("source_id"),  # optional
+                    "created_at": chunk.get("created_at"),  # optional
+                    "uid": chunk.get("uid"),  # optional
+                    "session_id": chunk.get("session_id"),  # optional
+                    "hostname": chunk.get("hostname"),  # optional
+                    "channel_count": int(chunk["channel_count"]),
+                    "channel_format": chunk["channel_format"],
+                    "nominal_srate": float(chunk["nominal_srate"]),
+                }
             )
     return streams
 
@@ -1142,7 +1163,7 @@ def _read_chunks(f):
         XDF chunk.
     """
     while True:
-        chunk = dict()
+        chunk = {}
         try:
             chunk["nbytes"] = _read_varlen_int(f)
         except EOFError:
